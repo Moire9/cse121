@@ -86,9 +86,18 @@ static void gpio_init() {
 	LOG("GPIO init.");
 }
 
-// static esp_err_t i2c_read_addr(i2c_device_handle handle, const uint8_t reg_addr, uint8_t* data_ptr, const size_t len) {
-// 	return i2c_master_transmit_receive(handle, &reg_addr, 1, data_ptr, len, I2C_TIMEOUT);
-// }
+static uint8_t crc(const uint8_t msb, const uint8_t lsb) {
+	uint8_t crc = 0xFF;
+	crc ^= msb;
+	for (int i = 0; i < 8; i++) {
+		crc = (crc << 1) ^ ((crc & 0x80) ? 0x31 : 0);
+	}
+	crc ^= lsb;
+	for (int i = 0; i < 8; i++) {
+		crc = (crc << 1) ^ ((crc & 0x80) ? 0x31 : 0);
+	}
+	return crc;
+}
 
 static esp_err_t i2c_read(i2c_device_handle handle, uint8_t* data_ptr, const size_t len) {
 	return i2c_master_receive(handle, data_ptr, len, I2C_TIMEOUT);
@@ -113,8 +122,6 @@ const uint8_t sleep_cmd[] = {
 
 void app_main() {
 #define ERRCHK(expr) ESP_ERROR_CHECK_WITHOUT_ABORT(expr)
-
-	LOG("app_main start.");
 	gpio_init();
 
 	i2c_device_handle device_handle;
@@ -122,51 +129,55 @@ void app_main() {
 
 	i2c_init(&device_handle, &bus_handle);
 
-	ERRCHK(
-		i2c_write(device_handle, reset_cmd, 2)
-	);
-	LOG("Reset.");
-
 	while (1) {
 		if (!active) {
-			LOG("Ending!");
+			LOG("Shutdown!");
 			break;
 		}
-		ERRCHK(
+
+		ERRCHK( // WAKE
 			i2c_write(device_handle, wake_cmd, 2)
 		);
 
-		LOG("Device woke.");
+		vTaskDelay(20 / portTICK_PERIOD_MS);
 
-
-		LOG("Requesting measurement...");
-		ERRCHK(
+		ERRCHK( // MEASURE
 			i2c_write(device_handle, meas_cmd, 2)
 		);
 
 		vTaskDelay(20 / portTICK_PERIOD_MS);
 
-		LOG("Reading...");
 		uint8_t meas_out[6];
-		ERRCHK(
+		ERRCHK( // READ
 			i2c_read(device_handle, meas_out, 6)
 		);
 
-		LOG("Got: %0.2X%0.2X [%0.2X] %0.2X%0.2X [%0.2X]", meas_out[0], meas_out[1], meas_out[2], meas_out[3], meas_out[4], meas_out[5]);
+		if (crc(meas_out[0], meas_out[1]) != meas_out[2])
+			LOG("Temperature FAILED crc");
 
-		ERRCHK(
+		if (crc(meas_out[3], meas_out[4]) != meas_out[5])
+			LOG(   "Humidity FAILED crc");
+
+		const uint32_t tempraw = meas_out[0] << 8 | meas_out[1];
+		const uint32_t  humraw = meas_out[3] << 8 | meas_out[4];
+
+		const  int8_t deg_c = ((tempraw * 175) >> 16) - 45;
+		const int32_t deg_f = ((tempraw * 315) >> 16) - 49;
+		const uint8_t    rh =  ( humraw * 100) >> 16;
+
+		ESP_LOGI(NAME, "Temperature is %dC (or %dF) with a %d%% humidity", deg_c, deg_f, rh);
+
+		ERRCHK( // SLEEP
 			i2c_write(device_handle, sleep_cmd, 2)
 		);
 
-		LOG("Device sleeping.");
+		if (!active) {
+			LOG("Shutdown!");
+			break;
+		}
 
 		vTaskDelay(2000 / portTICK_PERIOD_MS);
 	}
-
-	// ERRCHK(
-	// 	i2c_write(device_handle, reset_cmd, 2)
-	// );
-	// LOG("Device reset.");
 
 	i2c_master_bus_rm_device(device_handle);
 	i2c_del_master_bus(bus_handle);
