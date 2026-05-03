@@ -116,13 +116,13 @@ esp_err_t DFRobot_RGBLCD1602::init()
 void DFRobot_RGBLCD1602::clear()
 {
 	command(LCD_CLEARDISPLAY);        // clear display, set cursor position to zero
-	vTaskDelay(2 / portTICK_PERIOD_MS);   // this command takes a long time!
+	vTaskDelay(10 / portTICK_PERIOD_MS);   // this command takes a long time!
 }
 
 void DFRobot_RGBLCD1602::home()
 {
 	command(LCD_RETURNHOME);        // set cursor position to zero
-	vTaskDelay(2 / portTICK_PERIOD_MS); // this command takes a long time!
+	vTaskDelay(10 / portTICK_PERIOD_MS); // this command takes a long time!
 }
 
 void DFRobot_RGBLCD1602::noDisplay()
