@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdio.h>
 #include <stdbool.h>
 
@@ -24,6 +25,9 @@ static const char *NAME = "UDS";
 #define GPIO_ECHO 0 // Echo signal from UDS
 #define GPIO_TRIG 1 // Trigger signal to UDS
 #define GPIO_MASK(num) (1ULL << (num))
+
+#define HIST_LOG2 4
+#define HIST_SIZE (1 << HIST_LOG2)
 
 typedef i2c_master_bus_handle_t i2c_bus_handle;
 typedef i2c_master_dev_handle_t i2c_device_handle;
@@ -184,88 +188,97 @@ const uint8_t sleep_cmd[] = {
 	0xB0, 0x98
 };
 
-void app_main() {
-	echo_queue = xQueueCreate(10, sizeof(int64_t));
+int8_t get_temperature(i2c_device_handle device_handle) {
+#define CHK_(err) do { if ((err) != ESP_OK) {\
+	ESP_ERROR_CHECK_WITHOUT_ABORT(err);\
+	return -127 /* indicate error with value outside SHTC3 range */;\
+} } while (0)
 
-	timer_init();
-	gpio_init();
+	CHK_( // WAKE
+		i2c_write(device_handle, wake_cmd, 2)
+	);
 
-	while (1) {
-		trigger();
+	vTaskDelay(20 / portTICK_PERIOD_MS);
 
-		int64_t delta;
-		if (xQueueReceive(echo_queue, &delta, 15 / portTICK_PERIOD_MS)) {
-			LOG("Got bounce: %"PRId64" us", delta);
-		} else { // Maximum rated distance is 4m, corresponding to ~12ms, so we generously wait 15 ms
-			LOG("Timed out waiting for bounce.");
-		}
+	CHK_( // MEASURE
+		i2c_write(device_handle, meas_cmd, 2)
+	);
 
-		// vTaskDelay(1000 / portTICK_PERIOD_MS);
-	}
+	vTaskDelay(20 / portTICK_PERIOD_MS);
+
+	uint8_t meas_out[6];
+	CHK_( // READ
+		i2c_read(device_handle, meas_out, 6)
+	);
+
+	CHK_( // SLEEP
+		i2c_write(device_handle, sleep_cmd, 2)
+	);
+
+	if (crc(meas_out[0], meas_out[1]) != meas_out[2])
+		return -127;
+
+	const uint16_t temp_data = meas_out[0] << 8 | meas_out[1];
+	// If this doesn't work, cast raw to u32
+	return ((temp_data * 175) >> 16) - 45;
+#undef CHK_
 }
 
-void app_main_old() {
-#define ERRCHK(expr) ESP_ERROR_CHECK_WITHOUT_ABORT(expr)
-	gpio_init();
+double calculate_raw_dist(i2c_device_handle device_handle) {
+	xQueueReset(echo_queue);
+	trigger();
 
+	int64_t delta;
+	if (!xQueueReceive(echo_queue, &delta, 15 / portTICK_PERIOD_MS)) {
+		// Maximum rated distance is 4m, corresponding to ~12ms, so we generously wait 15 ms
+		LOG("Timed out waiting for bounce");
+		return NAN;
+	}
+
+	const int8_t temp = get_temperature(device_handle); // Celcius
+	if (temp == -127) {
+		LOG("Failed to get temperature");
+		return NAN;
+	}
+
+	const double sound_vel = 331 + 0.6 * temp;
+
+	// LOG("dt = %"PRId64" us, T = %"PRId8" C, v = %.1f m/s", delta, temp, sound_vel);
+	return delta * (sound_vel / 10000 /* cm/us */);
+}
+
+void app_main() {
 	i2c_device_handle device_handle;
 	i2c_bus_handle bus_handle;
 
 	i2c_init(&device_handle, &bus_handle);
 
-	while (1) {
-		if (!active) {
-			LOG("Shutdown!");
-			break;
-		}
+	echo_queue = xQueueCreate(1, sizeof(int64_t));
 
-		ERRCHK( // WAKE
-			i2c_write(device_handle, wake_cmd, 2)
-		);
+	timer_init();
+	gpio_init();
 
-		vTaskDelay(20 / portTICK_PERIOD_MS);
+	double hist[HIST_SIZE] = {0};
+	uint8_t idx = 0;
+	while (active) {
+		const double dist = calculate_raw_dist(device_handle);
+		if (dist != dist) continue; // NaN
 
-		ERRCHK( // MEASURE
-			i2c_write(device_handle, meas_cmd, 2)
-		);
+		hist[idx] = dist;
 
-		vTaskDelay(20 / portTICK_PERIOD_MS);
+		idx = (idx + 1) & (HIST_SIZE - 1);
 
-		uint8_t meas_out[6];
-		ERRCHK( // READ
-			i2c_read(device_handle, meas_out, 6)
-		);
+		double d = 0; // average, short name for scaled equation
+		for (int i = 0; i < HIST_SIZE; i++)
+		    d += hist[i];
+		d /= HIST_SIZE;
 
-		if (crc(meas_out[0], meas_out[1]) != meas_out[2])
-			LOG("Temperature FAILED crc");
+		const double scaled = // cubic regression I found
+			0.000781598 * d*d*d - 0.0531792 * d*d +1.63765 * d - 7.18473;
 
-		if (crc(meas_out[3], meas_out[4]) != meas_out[5])
-			LOG(   "Humidity FAILED crc");
-
-		const uint32_t tempraw = meas_out[0] << 8 | meas_out[1];
-		const uint32_t  humraw = meas_out[3] << 8 | meas_out[4];
-
-		const  int8_t deg_c = ((tempraw * 175) >> 16) - 45;
-		const int32_t deg_f = ((tempraw * 315) >> 16) - 49;
-		const uint8_t    rh =  ( humraw * 100) >> 16;
-
-		ESP_LOGI(NAME, "Temperature is %dC (or %dF) with a %d%% humidity", deg_c, deg_f, rh);
-
-		ERRCHK( // SLEEP
-			i2c_write(device_handle, sleep_cmd, 2)
-		);
-
-		if (!active) {
-			LOG("Shutdown!");
-			break;
-		}
-
-		vTaskDelay(2000 / portTICK_PERIOD_MS);
+		LOG("dx = %.2f cm%s", scaled, idx ? "" : " [!]");
 	}
 
 	i2c_master_bus_rm_device(device_handle);
 	i2c_del_master_bus(bus_handle);
-
-	LOG("I2C shutdown. Goodbye.");
-#undef ERRCHK
 }
