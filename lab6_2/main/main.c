@@ -33,21 +33,9 @@
 #define EXAMPLE_ESP_MAXIMUM_RETRY  5
 
 #define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_BOTH
-#define EXAMPLE_H2E_IDENTIFIER ""//CONFIG_ESP_WIFI_PW_ID
+#define EXAMPLE_H2E_IDENTIFIER ""
 
-// #elif CONFIG_ESP_WIFI_AUTH_WPA_PSK
-// #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA_PSK
-// #elif CONFIG_ESP_WIFI_AUTH_WPA2_PSK
-// #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA2_PSK
-// #elif CONFIG_ESP_WIFI_AUTH_WPA_WPA2_PSK
 #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA_WPA2_PSK
-// #elif CONFIG_ESP_WIFI_AUTH_WPA3_PSK
-// #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA3_PSK
-// #elif CONFIG_ESP_WIFI_AUTH_WPA2_WPA3_PSK
-// #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA2_WPA3_PSK
-// #elif CONFIG_ESP_WIFI_AUTH_WAPI_PSK
-// #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WAPI_PSK
-// #endif
 
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
@@ -64,8 +52,82 @@ static const char *TAG = "WeatherStation";
 
 #define BUFMAX 8192
 
+#define I2C_SCL_GPIO 8
+#define I2C_SDA_GPIO 10
+#define I2C_FREQ 300'000 // Hz
+#define I2C_TIMEOUT -1 // ms
+#define SHTC3_ADDR 0x70
+
+#include "esp_check.h"
+#include "driver/i2c_master.h"
+
 static int s_retry_num = 0;
 
+typedef i2c_master_bus_handle_t i2c_bus_handle;
+typedef i2c_master_dev_handle_t i2c_device_handle;
+typedef i2c_master_bus_config_t i2c_bus_config;
+typedef i2c_device_config_t     i2c_device_config;
+
+static void i2c_init(i2c_device_handle* device_handle, i2c_bus_handle* bus_handle) {
+	const i2c_bus_config busconf = {
+		.i2c_port   = I2C_NUM_0, // i2c lib macro
+		.scl_io_num = I2C_SCL_GPIO,
+		.sda_io_num = I2C_SDA_GPIO,
+		.clk_source = I2C_CLK_SRC_DEFAULT, // i2c lib macro
+		.glitch_ignore_cnt = 7, // I have no idea what this means
+		.flags.enable_internal_pullup = true,
+	};
+
+	const i2c_device_config devconf = {
+		.dev_addr_length = I2C_ADDR_BIT_LEN_7,
+		.device_address  = SHTC3_ADDR,
+		.scl_speed_hz    = I2C_FREQ,
+	};
+
+	ESP_ERROR_CHECK(
+		i2c_new_master_bus(&busconf, bus_handle)
+	);
+
+	ESP_ERROR_CHECK(
+		i2c_master_bus_add_device(*bus_handle, &devconf, device_handle)
+	);
+
+	LOG("I2C init.");
+}
+
+static uint8_t crc(const uint8_t msb, const uint8_t lsb) {
+	uint8_t crc = 0xFF;
+	crc ^= msb;
+	for (int i = 0; i < 8; i++) {
+		crc = (crc << 1) ^ ((crc & 0x80) ? 0x31 : 0);
+	}
+	crc ^= lsb;
+	for (int i = 0; i < 8; i++) {
+		crc = (crc << 1) ^ ((crc & 0x80) ? 0x31 : 0);
+	}
+	return crc;
+}
+
+static esp_err_t i2c_read(i2c_device_handle handle, uint8_t* data_ptr, const size_t len) {
+	return i2c_master_receive(handle, data_ptr, len, I2C_TIMEOUT);
+}
+
+static esp_err_t i2c_write(i2c_device_handle handle, const uint8_t* data_ptr, const size_t len) {
+	return i2c_master_transmit(handle, data_ptr, len, I2C_TIMEOUT);
+}
+
+const uint8_t reset_cmd[] = {
+	0x80, 0x5D
+};
+const uint8_t wake_cmd[] = {
+	0x35, 0x17
+};
+const uint8_t meas_cmd[] = {
+	0x78, 0x66
+};
+const uint8_t sleep_cmd[] = {
+	0xB0, 0x98
+};
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 								int32_t event_id, void* event_data)
@@ -166,22 +228,52 @@ esp_err_t http_event_handler(esp_http_client_event_t *event) {
 				memcpy(event->user_data, event->data, len);
 				((char*) event->user_data)[len - 1] = 0; // null-terminate
 			}
-			// ((char*)event->data)[event->data_len] = 0;
-			// LOG("%s", event->data);
-			// ESP_LOG_BUFFER_HEX(TAG, event->data, strlen(event->data));
-			// if (event->user_data) {
-			// 	memcpy(event->user_data, event->data, BUFMAX); // it's probably fine
-			// }
 		}
 	}
 	return ESP_OK;
 }
 
 void weather_loop(void* /* ignored */) {
+#define ERRCHK(expr) ESP_ERROR_CHECK_WITHOUT_ABORT(expr)
 	char response_buffer[BUFMAX] = {0};
 
+	i2c_device_handle device_handle;
+	i2c_bus_handle bus_handle;
+
+	i2c_init(&device_handle, &bus_handle);
+
 	while (1) {
-		// LOG("Starting weather loop");
+		ERRCHK( // WAKE
+			i2c_write(device_handle, wake_cmd, 2)
+		);
+
+		vTaskDelay(20 / portTICK_PERIOD_MS);
+
+		ERRCHK( // MEASURE
+			i2c_write(device_handle, meas_cmd, 2)
+		);
+
+		vTaskDelay(20 / portTICK_PERIOD_MS);
+
+		uint8_t meas_out[6];
+		ERRCHK( // READ
+			i2c_read(device_handle, meas_out, 6)
+		);
+
+		if (crc(meas_out[0], meas_out[1]) != meas_out[2]) {
+			LOG("Temperature FAILED crc");
+			goto end;
+		}
+
+		const uint32_t tempraw = meas_out[0] << 8 | meas_out[1];
+		const  int8_t deg_c = ((tempraw * 175) >> 16) - 45;
+
+		ERRCHK( // SLEEP
+			i2c_write(device_handle, sleep_cmd, 2)
+		);
+
+
+		// Post data to server
 		xEventGroupWaitBits(
 			s_wifi_event_group,
 			WIFI_CONNECTED_BIT,
@@ -189,9 +281,12 @@ void weather_loop(void* /* ignored */) {
 			pdFALSE, // ignored for single bit check
 			60000 / portTICK_PERIOD_MS
 		);
-		// LOG("Connected bit.");
 
-		const char* post_data = "TEST";
+		char post_data[5];
+
+		sprintf(post_data, "%d", deg_c);
+
+		LOG("Sending `%s`", post_data);
 
 		const esp_http_client_config_t config = {
 			.url = "http://10.42.0.1:1234",
@@ -202,8 +297,8 @@ void weather_loop(void* /* ignored */) {
 		};
 
 		esp_http_client_handle_t client_inst = esp_http_client_init(&config);
-	    esp_http_client_set_header(client_inst, "Content-Type", "text/plain");
-	    esp_http_client_set_post_field(client_inst, post_data, strlen(post_data));
+		esp_http_client_set_header(client_inst, "Content-Type", "text/plain");
+		esp_http_client_set_post_field(client_inst, post_data, strlen(post_data));
 
 		const esp_err_t err = esp_http_client_perform(client_inst);
 		// LOG("Requested.");
@@ -220,6 +315,7 @@ void weather_loop(void* /* ignored */) {
 end:
 		vTaskDelay(5000 / portTICK_PERIOD_MS);
 	}
+#undef ERRCHK
 }
 
 void app_main(void)

@@ -5,7 +5,7 @@ app = flask.Flask("weather_server")
 @app.route("/", methods = ["POST"])
 def post_recv():
 	text = flask.request.get_data(as_text=True)
-	print(text)
+	print(f"Temperature: {text}°C")
 	return ""
 
 @app.route("/location", methods = ["GET"])
