@@ -6,7 +6,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/queue.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,17 +21,9 @@ static const char *TAG = "MorseRX";
 #define LOG(...) ESP_LOGI(TAG, __VA_ARGS__)
 
 #define WORD_BUF_SIZE 32
-#define SYM_BUF_SIZE 8
+#define SYM_BUF_SIZE 16
 
 enum symbol { DIT, DAH, GAP };
-
-struct entry {
-	enum symbol sym;
-	STAILQ_ENTRY(entry) entries;
-};
-STAILQ_HEAD(sym_head, entry);
-struct sym_head queue = STAILQ_HEAD_INITIALIZER(queue);
-
 char decode(const uint16_t);
 
 void app_main() {
@@ -51,7 +42,7 @@ void app_main() {
 	};
 	ESP_ERROR_CHECK(adc_oneshot_config_channel(handle, ADC_CHANNEL_0, &chan_config));
 
-	uint64_t dit_duration = 80; // us
+	uint64_t dit_duration = 100; // us
 	uint64_t last_change = esp_timer_get_time();
 	int last_state = 0;
 
@@ -80,32 +71,14 @@ void app_main() {
 						symidx = 0;
 					}
 
-					// struct entry* item = malloc(sizeof(struct entry));
-					// if (item == NULL) {
-					// 	ESP_LOGE(TAG, "Unable to allocate memory");
-					// 	return;
-					// }
-					// item->sym = DIT;
-					// STAILQ_INSERT_TAIL(&queue, item, entries);
-
 					dit_duration = (dit_duration + duration) / 2;
-					// LOG("%d DOT", duration);
 				} else if (duration > hthirds) { // Dah
 					symbuffer[symidx++] = DAH;
 					if (symidx > SYM_BUF_SIZE) {
 						LOG("Overflow.");
 						symidx = 0;
 					}
-
-					// struct entry* item = malloc(sizeof(struct entry));
-					// if (item == NULL) {
-					// 	ESP_LOGE(TAG, "Unable to allocate memory");
-					// 	return;
-					// }
-					// item->sym = DAH;
-					// STAILQ_INSERT_TAIL(&queue, item, entries);
-					// LOG("%d DASH", duration);
-				} //else LOG("%d SHORT", duration);
+				}
 			} else { // Off pulse
 				if (duration > dit_duration / 4 && duration <= dit_duration * 2) { // Inter-symbol space
 					symbuffer[symidx++] = GAP;
@@ -114,23 +87,10 @@ void app_main() {
 						symidx = 0;
 					}
 
-					// struct entry* item = malloc(sizeof(struct entry));
-					// if (item == NULL) {
-					// 	ESP_LOGE(TAG, "Unable to allocate memory");
-					// 	return;
-					// }
-					// item->sym = GAP;
-					// STAILQ_INSERT_TAIL(&queue, item, entries);
-
 					dit_duration = (dit_duration + duration) / 2;
-					// LOG("%d GAP", duration);
 				} else if (duration > dit_duration * 2) {
 					// Long space - either inter-character or inter-word
 					// Decode the preceding character
-
-					// .  - .. .-. 
-					// 0  1 1  1
-
 					// We will store as a bit string, with first symbol MSB, last LSB
 					// Characters are expressed as a sequence of 8 doublets
 					// 00 -> (nothing)
@@ -138,19 +98,15 @@ void app_main() {
 					// 11 -> dah
 					uint16_t character = 0;
 					enum symbol previous = GAP;
-					// struct entry* item;
 
-					// STAILQ_FOREACH(item, &queue, entries) {
 					for (int i = 0; i < symidx; ++i) {
-						// switch (item->sym) {
 						switch (symbuffer[i]) {
 						case DIT:
 							if (previous == GAP) {
 								character |= 0b01;
-							} else { // Two consecutive symbols without a gap become a dah
-								character |= 0b11;
-							}
-							break;
+								break;
+							} // Two consecutive symbols without a gap become a dah
+							__attribute__ ((fallthrough));
 						case DAH:
 							character |= 0b11;
 							break;
@@ -159,26 +115,17 @@ void app_main() {
 								character <<= 2;
 							break;
 						}
-						// previous = item->sym;
 						previous = symbuffer[i];
 					}
 					symidx = 0;
 					if (previous == GAP)
 						character >>= 2;
 
-					// Clear queue
-					// while (!STAILQ_EMPTY(&queue)) {
-					// 	item = STAILQ_FIRST(&queue);
-					// 	STAILQ_REMOVE_HEAD(&queue, entries);
-					// 	free(item);
-					// }
-
 					const char decoded = decode(character);
 					if (decoded == ' ') {
 						ESP_LOGW(TAG, "Unable to decode %d", character);
 					}
 
-					// LOG("%c", decoded);
 					wordbuffer[wordidx++] = decoded;
 
 					if (duration > dit_duration * 5 || wordidx > WORD_BUF_SIZE) {
