@@ -4,13 +4,19 @@ from time import sleep
 from sys import argv
 
 PIN = 26
-DIT = 0.3 # s
+DIT = 0.00010 # s
 DAH = 3 * DIT
 SIGNAL_SPACE = DIT
 LETTER_SPACE = 3 * DIT - SIGNAL_SPACE
 WORD_SPACE = 7 * DIT - LETTER_SPACE
 
 morse = {"a": ".-", "b": "-...", "c": "-.-.", "d": "-..", "e": ".", "f": "..-.", "g": "--.", "h": "....", "i": "..", "j": ".---", "k": "-.-", "l": ".-..", "m": "--", "n": "-.", "o": "---", "p": ".--.", "q": "--.-", "r": ".-.", "s": "...", "t": "-", "u": "..-", "v": "...-", "w": ".--", "x": "-..-", "y": "-.--", "z": "--..", "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-", "5": ".....", "6": "-....", "7": "--...", "8": "---..", "9": "----.", ".": ".-.-.-", ",": "--..--", "?": "..--..", "'": ".----.", "!": "-.-.--", "/": "-..-.", "(": "-.--.", ")": "-.--.-", "&": ".-...", ":": "---...", ";": "-.-.-.", "=": "-...-", "+": ".-.-.", "-": "-....-", "_": "..--.-", "\"": ".-..-.", "$": "...-..-", "@": ".--.-.", "¿": "..-.-", "¡": "--...-"}
+
+"""
+def sleep(duration):
+	end = perf_counter() + duration
+	while perf_counter() < end: pass
+"""
 
 def send_char(char):
 	if char == " ":
@@ -41,13 +47,16 @@ if __name__ == "__main__":
 		else:
 			send_quantity = 1
 			text = args[0] + " " + text
-	GPIO.setmode(GPIO.BOARD)
+	text = text.lower()
+
+	GPIO.setmode(GPIO.BCM)
 	GPIO.setup(PIN, GPIO.OUT)
 
 	try:
-		for _ in range(send_quantity):
+		for i in range(send_quantity):
 			for c in text:
-				send(c)
-			SLEEP(WORD_SPACE * 3)
+				send_char(c)
+			if i != send_quantity - 1:
+				sleep(WORD_SPACE * 3)
 	finally:
 		GPIO.cleanup()
