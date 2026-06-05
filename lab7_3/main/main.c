@@ -15,20 +15,73 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "driver/gpio.h"
 
 static const char *TAG = "MorseRX";
 
+#define GPIO_INPUT 0
+#define GPIO_INPUT_MASK (1ULL << (GPIO_INPUT))
+
+#define GPIO_STOP_BUTTON 9
+#define GPIO_STOP_BUTTON_MASK (1ULL << (GPIO_STOP_BUTTON)) // GPIO9 "Boot" user button
+
 #define LOG(...) ESP_LOGI(TAG, __VA_ARGS__)
 
+#define WORDTIME_BUF_SIZE 16
 #define WORD_BUF_SIZE 32
 #define SYM_BUF_SIZE 16
+
+typedef struct {
+	char word[WORD_BUF_SIZE + 1];
+	uint64_t time;
+} wordtime;
 
 enum symbol { DIT, DAH, GAP };
 char decode(const uint16_t);
 
+static int print_word_buf = false;
+
+static void IRAM_ATTR gpio_interrupt(void* /* ignored */) {
+	print_word_buf = true;
+}
+
+static void gpio_init() {
+	gpio_config_t btncfg = {
+		.pin_bit_mask = GPIO_STOP_BUTTON_MASK,
+		.mode         = GPIO_MODE_INPUT,
+		.pull_up_en   = GPIO_PULLUP_ENABLE,
+		.pull_down_en = GPIO_PULLDOWN_DISABLE,
+		.intr_type    = GPIO_INTR_POSEDGE,
+	};
+
+	ESP_ERROR_CHECK(
+		gpio_config(&btncfg)
+	);
+	ESP_ERROR_CHECK(
+		gpio_install_isr_service(0 /* no special flags */)
+	);
+	ESP_ERROR_CHECK(
+		gpio_isr_handler_add(GPIO_STOP_BUTTON, gpio_interrupt, (void*) 0 /* ignored */)
+	);
+
+	// gpio_config_t ipcfg = {
+	// 	.pin_bit_mask = GPIO_INPUT_MASK,
+	// 	.mode         = GPIO_MODE_INPUT,
+	// 	.pull_up_en   = GPIO_PULLUP_DISABLE,
+	// 	.pull_down_en = GPIO_PULLUP_ENABLE,
+	// 	.intr_type    = GPIO_INTR_DISABLE,
+	// };
+	// ESP_ERROR_CHECK(
+	// 	gpio_config(&ipcfg)
+	// );
+
+	LOG("GPIO init.");
+}
+
 void app_main() {
+	gpio_init();
 	
-	//-------------ADC1 Init---------------//
+	// -------------ADC1 Init---------------//
 	adc_oneshot_unit_handle_t handle;
 	const adc_oneshot_unit_init_cfg_t init_config = {
 		.unit_id = ADC_UNIT_1,
@@ -42,7 +95,7 @@ void app_main() {
 	};
 	ESP_ERROR_CHECK(adc_oneshot_config_channel(handle, ADC_CHANNEL_0, &chan_config));
 
-	uint64_t dit_duration = 80; // us
+	uint64_t dit_duration = 100; // us
 	uint64_t last_change = esp_timer_get_time();
 	int last_state = 0;
 
@@ -54,11 +107,23 @@ void app_main() {
 	enum symbol symbuffer[SYM_BUF_SIZE + 1] = {0};
 	int symidx = 0;
 
+	wordtime wordtimebuffer[WORDTIME_BUF_SIZE + 1] = {0};
+	int wordtimeidx = 0;
+
 	while (1) {
+		if (print_word_buf) {
+			print_word_buf = false;
+			LOG("Received:");
+			for (int i = 0; i < wordtimeidx; ++i) {
+				LOG("%32s [%d]", wordtimebuffer[i].word, wordtimebuffer[i].time);
+			}
+			wordtimeidx = 0;
+		}
+
 		int adc;
 		ESP_ERROR_CHECK(adc_oneshot_read(handle, ADC_CHANNEL_0, &adc));
-
 		const int state = adc > 40;
+		// const int state = gpio_get_level(GPIO_INPUT);
 		if (last_state != state) {
 			const int time = esp_timer_get_time();
 			const int duration = time - last_change;
@@ -133,9 +198,20 @@ void app_main() {
 					if (duration > dit_duration * 5 || wordidx > WORD_BUF_SIZE) {
 						const uint64_t word_end_time = esp_timer_get_time();
 						const uint64_t word_duration = word_end_time - word_start_time;
-						LOG("%s [%d]", wordbuffer, word_duration);
+						// LOG("%s [%d]", wordbuffer, word_duration);
+						wordtime w = {
+							// .word = {0},
+							.time = word_duration,
+						};
+						memcpy(w.word, wordbuffer, sizeof(wordbuffer));
+						wordtimebuffer[wordtimeidx++] = w;
+						if (wordtimeidx > WORDTIME_BUF_SIZE) {
+							print_word_buf = true;
+						}
+
 						memset(wordbuffer, 0, sizeof(wordbuffer));
 						wordidx = 0;
+
 						word_start_time = esp_timer_get_time();
 					}
 				}
