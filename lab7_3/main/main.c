@@ -46,6 +46,8 @@ void app_main() {
 	uint64_t last_change = esp_timer_get_time();
 	int last_state = 0;
 
+	uint64_t word_start_time = esp_timer_get_time();
+
 	char wordbuffer[WORD_BUF_SIZE + 1] = {0};
 	int wordidx = 0;
 
@@ -129,9 +131,12 @@ void app_main() {
 					wordbuffer[wordidx++] = decoded;
 
 					if (duration > dit_duration * 5 || wordidx > WORD_BUF_SIZE) {
-						LOG("%s", wordbuffer);
+						const uint64_t word_end_time = esp_timer_get_time();
+						const uint64_t word_duration = word_end_time - word_start_time;
+						LOG("%s [%d]", wordbuffer, word_duration);
 						memset(wordbuffer, 0, sizeof(wordbuffer));
 						wordidx = 0;
+						word_start_time = esp_timer_get_time();
 					}
 				}
 			}
